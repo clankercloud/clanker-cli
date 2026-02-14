@@ -478,10 +478,11 @@ func (p *EKSProvider) ListClusters(ctx context.Context) ([]ClusterInfo, error) {
 		if err != nil {
 			// Include basic info even if full details fail
 			clusters = append(clusters, ClusterInfo{
-				Name:   name,
-				Type:   ClusterTypeEKS,
-				Status: "unknown",
-				Region: p.region,
+				Name:             name,
+				Type:             ClusterTypeEKS,
+				Status:           "unknown",
+				NormalizedStatus: ClusterStatusUnknown,
+				Region:           p.region,
 			})
 			continue
 		}
@@ -502,6 +503,7 @@ func (p *EKSProvider) GetCluster(ctx context.Context, clusterName string) (*Clus
 		Name:              cluster.Name,
 		Type:              ClusterTypeEKS,
 		Status:            cluster.Status,
+		NormalizedStatus:  NormalizeEKSStatus(cluster.Status),
 		KubernetesVersion: cluster.Version,
 		Endpoint:          cluster.Endpoint,
 		Region:            p.region,

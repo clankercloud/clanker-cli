@@ -11,10 +11,29 @@ type ClusterType string
 const (
 	ClusterTypeEKS      ClusterType = "eks"
 	ClusterTypeGKE      ClusterType = "gke"
+	ClusterTypeAKS      ClusterType = "aks"
 	ClusterTypeKubeadm  ClusterType = "kubeadm"
 	ClusterTypeKops     ClusterType = "kops"
 	ClusterTypeK3s      ClusterType = "k3s"
 	ClusterTypeExisting ClusterType = "existing"
+)
+
+// ClusterStatus represents the normalized status of a cluster
+type ClusterStatus string
+
+const (
+	// ClusterStatusReady indicates the cluster is ready and operational
+	ClusterStatusReady ClusterStatus = "ready"
+	// ClusterStatusCreating indicates the cluster is being created
+	ClusterStatusCreating ClusterStatus = "creating"
+	// ClusterStatusUpdating indicates the cluster is being updated
+	ClusterStatusUpdating ClusterStatus = "updating"
+	// ClusterStatusDeleting indicates the cluster is being deleted
+	ClusterStatusDeleting ClusterStatus = "deleting"
+	// ClusterStatusError indicates the cluster is in an error state
+	ClusterStatusError ClusterStatus = "error"
+	// ClusterStatusUnknown indicates the cluster status could not be determined
+	ClusterStatusUnknown ClusterStatus = "unknown"
 )
 
 // NodeInfo contains information about a cluster node
@@ -30,16 +49,17 @@ type NodeInfo struct {
 
 // ClusterInfo contains cluster details
 type ClusterInfo struct {
-	Name              string      `json:"name"`
-	Type              ClusterType `json:"type"`
-	Status            string      `json:"status"`
-	KubernetesVersion string      `json:"kubernetes_version"`
-	Endpoint          string      `json:"endpoint"`
-	ControlPlaneNodes []NodeInfo  `json:"control_plane_nodes,omitempty"`
-	WorkerNodes       []NodeInfo  `json:"worker_nodes,omitempty"`
-	CreatedAt         time.Time   `json:"created_at"`
-	Region            string      `json:"region,omitempty"`
-	VPCID             string      `json:"vpc_id,omitempty"`
+	Name              string        `json:"name"`
+	Type              ClusterType   `json:"type"`
+	Status            string        `json:"status"`
+	NormalizedStatus  ClusterStatus `json:"normalized_status"`
+	KubernetesVersion string        `json:"kubernetes_version"`
+	Endpoint          string        `json:"endpoint"`
+	ControlPlaneNodes []NodeInfo    `json:"control_plane_nodes,omitempty"`
+	WorkerNodes       []NodeInfo    `json:"worker_nodes,omitempty"`
+	CreatedAt         time.Time     `json:"created_at"`
+	Region            string        `json:"region,omitempty"`
+	VPCID             string        `json:"vpc_id,omitempty"`
 }
 
 // HealthStatus represents cluster health
@@ -245,4 +265,81 @@ type ErrInvalidConfiguration struct {
 
 func (e *ErrInvalidConfiguration) Error() string {
 	return "invalid cluster configuration: " + e.Message
+}
+
+// NormalizeEKSStatus converts EKS-specific status to normalized ClusterStatus
+func NormalizeEKSStatus(status string) ClusterStatus {
+	switch status {
+	case "ACTIVE":
+		return ClusterStatusReady
+	case "CREATING":
+		return ClusterStatusCreating
+	case "UPDATING":
+		return ClusterStatusUpdating
+	case "DELETING":
+		return ClusterStatusDeleting
+	case "FAILED":
+		return ClusterStatusError
+	case "PENDING":
+		return ClusterStatusCreating
+	default:
+		return ClusterStatusUnknown
+	}
+}
+
+// NormalizeGKEStatus converts GKE-specific status to normalized ClusterStatus
+func NormalizeGKEStatus(status string) ClusterStatus {
+	switch status {
+	case "RUNNING":
+		return ClusterStatusReady
+	case "PROVISIONING":
+		return ClusterStatusCreating
+	case "RECONCILING":
+		return ClusterStatusUpdating
+	case "STOPPING":
+		return ClusterStatusDeleting
+	case "ERROR":
+		return ClusterStatusError
+	case "DEGRADED":
+		return ClusterStatusError
+	case "STATUS_UNSPECIFIED":
+		return ClusterStatusUnknown
+	default:
+		return ClusterStatusUnknown
+	}
+}
+
+// NormalizeAKSStatus converts AKS-specific status to normalized ClusterStatus
+func NormalizeAKSStatus(provisioningState string) ClusterStatus {
+	switch provisioningState {
+	case "Succeeded":
+		return ClusterStatusReady
+	case "Creating":
+		return ClusterStatusCreating
+	case "Updating":
+		return ClusterStatusUpdating
+	case "Deleting":
+		return ClusterStatusDeleting
+	case "Failed":
+		return ClusterStatusError
+	case "Canceled":
+		return ClusterStatusError
+	default:
+		return ClusterStatusUnknown
+	}
+}
+
+// IsReady returns true if the cluster is in a ready state
+func (s ClusterStatus) IsReady() bool {
+	return s == ClusterStatusReady
+}
+
+// IsTransitioning returns true if the cluster is in a transitional state
+func (s ClusterStatus) IsTransitioning() bool {
+	return s == ClusterStatusCreating || s == ClusterStatusUpdating || s == ClusterStatusDeleting
+}
+
+// IsError returns true if the cluster is in an error state
+func (s ClusterStatus) IsError() bool {
+	return s == ClusterStatusError
 }
