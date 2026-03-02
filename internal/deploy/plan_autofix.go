@@ -1,6 +1,7 @@
 package deploy
 
 import (
+	"regexp"
 	"strings"
 
 	"github.com/bgdnvk/clanker/internal/maker"
@@ -20,6 +21,24 @@ func ApplyGenericPlanAutofix(plan *maker.Plan, logf func(string, ...any)) *maker
 	removed := pruneRedundantLaunchCycles(plan)
 	if removed > 0 {
 		logf("[deploy] generic autofix: collapsed %d redundant launch-cycle command(s)", removed)
+	}
+
+	// Dedup read-only describe/get commands targeting the same resource.
+	roRemoved := pruneRedundantReadOnly(plan)
+	if roRemoved > 0 {
+		logf("[deploy] generic autofix: removed %d redundant read-only command(s)", roRemoved)
+	}
+
+	// Generic SSM semantic dedup (works for any project, not just OpenClaw).
+	ssmRemoved := pruneSSMSemanticDuplicatesGeneric(plan)
+	if ssmRemoved > 0 {
+		logf("[deploy] generic autofix: removed %d redundant SSM command(s)", ssmRemoved)
+	}
+
+	// Remove commands referencing placeholders that no command produces.
+	orphanRemoved := pruneOrphanedPlaceholderRefs(plan)
+	if orphanRemoved > 0 {
+		logf("[deploy] generic autofix: removed %d orphaned-placeholder command(s)", orphanRemoved)
 	}
 
 	return plan
@@ -147,4 +166,245 @@ func argsContain(args []string, sub string) bool {
 		}
 	}
 	return false
+}
+
+// ---------------------------------------------------------------------------
+// Generic SSM semantic dedup
+// ---------------------------------------------------------------------------
+
+// classifySSMScriptGeneric returns a generic semantic category for a shell
+// script embedded in an SSM command. No project-specific patterns.
+func classifySSMScriptGeneric(script string) string {
+	if script == "" {
+		return ""
+	}
+	l := strings.ToLower(script)
+
+	hasStart := strings.Contains(l, "docker compose up") || strings.Contains(l, "docker-compose up") || strings.Contains(l, "docker run")
+	hasStop := (strings.Contains(l, "docker compose down") || strings.Contains(l, "docker compose stop") || strings.Contains(l, "docker-compose down")) && !hasStart
+	hasEnvWrite := (strings.Contains(l, "> .env") || strings.Contains(l, ">> .env") || strings.Contains(l, "cat >")) && strings.Contains(l, ".env")
+	hasECRPull := strings.Contains(l, "ecr get-login-password") || (strings.Contains(l, "docker pull") && strings.Contains(l, ".dkr.ecr."))
+	hasDiag := (strings.Contains(l, "docker logs") || strings.Contains(l, "docker ps") || strings.Contains(l, "curl -s") || strings.Contains(l, "health")) && !hasStart
+	hasClone := strings.Contains(l, "git clone")
+	hasMkdir := strings.Contains(l, "mkdir -p") && !hasClone && !hasStart && !hasEnvWrite
+
+	// Priority: clone > start > stop > env > ecr > diag > mkdir
+	switch {
+	case hasClone:
+		return "ssm-clone"
+	case hasStart:
+		return "ssm-service-start"
+	case hasStop:
+		return "ssm-service-stop"
+	case hasEnvWrite && !hasStart:
+		return "ssm-env-setup"
+	case hasECRPull:
+		return "ssm-ecr-pull"
+	case hasDiag:
+		return "ssm-diagnostics"
+	case hasMkdir:
+		return "ssm-mkdir"
+	}
+	return ""
+}
+
+// classifySSMIntentGeneric classifies an SSM send-command generically.
+func classifySSMIntentGeneric(args []string) string {
+	if len(args) < 4 {
+		return ""
+	}
+	svc := strings.ToLower(strings.TrimSpace(args[0]))
+	op := strings.ToLower(strings.TrimSpace(args[1]))
+	if svc != "ssm" || op != "send-command" {
+		return ""
+	}
+	script := extractSSMScriptFromArgs(args)
+	return classifySSMScriptGeneric(script)
+}
+
+// pruneSSMSemanticDuplicatesGeneric collapses SSM send-command steps that
+// repeat the same generic intent. Keeps the LAST of each category.
+func pruneSSMSemanticDuplicatesGeneric(plan *maker.Plan) int {
+	if plan == nil || len(plan.Commands) < 2 {
+		return 0
+	}
+
+	type tagged struct {
+		idx      int
+		category string
+	}
+
+	items := make([]tagged, len(plan.Commands))
+	for i, cmd := range plan.Commands {
+		items[i] = tagged{idx: i, category: classifySSMIntentGeneric(cmd.Args)}
+	}
+
+	lastOfCategory := map[string]int{}
+	for _, t := range items {
+		if t.category != "" {
+			lastOfCategory[t.category] = t.idx
+		}
+	}
+
+	filtered := make([]maker.Command, 0, len(plan.Commands))
+	removed := 0
+	for i, cmd := range plan.Commands {
+		cat := items[i].category
+		if cat == "" || items[i].idx == lastOfCategory[cat] {
+			filtered = append(filtered, cmd)
+		} else {
+			removed++
+		}
+	}
+	if removed > 0 {
+		plan.Commands = filtered
+	}
+	return removed
+}
+
+// ---------------------------------------------------------------------------
+// Orphaned placeholder pruning
+// ---------------------------------------------------------------------------
+
+// orphanPlaceholderRe matches <UPPER_CASE_KEY> placeholders in command args.
+var orphanPlaceholderRe = regexp.MustCompile(`<([A-Z][A-Z0-9_]+)>`)
+
+// pruneOrphanedPlaceholderRefs removes commands that reference a <KEY>
+// placeholder where no command in the plan produces that key. Cascades:
+// if a dropped command itself produces something, dependents are also dropped.
+func pruneOrphanedPlaceholderRefs(plan *maker.Plan) int {
+	if plan == nil || len(plan.Commands) < 2 {
+		return 0
+	}
+
+	drop := map[int]bool{}
+
+	for changed := true; changed; {
+		changed = false
+		// Rebuild produced set excluding dropped commands
+		produced := map[string]bool{}
+		for i, cmd := range plan.Commands {
+			if drop[i] {
+				continue
+			}
+			for k := range cmd.Produces {
+				produced[strings.TrimSpace(k)] = true
+			}
+		}
+
+		for i, cmd := range plan.Commands {
+			if drop[i] {
+				continue
+			}
+			for _, arg := range cmd.Args {
+				matches := orphanPlaceholderRe.FindAllStringSubmatch(arg, -1)
+				for _, m := range matches {
+					if !produced[m[1]] {
+						drop[i] = true
+						changed = true
+						break
+					}
+				}
+				if drop[i] {
+					break
+				}
+			}
+		}
+	}
+
+	if len(drop) == 0 {
+		return 0
+	}
+
+	filtered := make([]maker.Command, 0, len(plan.Commands)-len(drop))
+	for i, cmd := range plan.Commands {
+		if !drop[i] {
+			filtered = append(filtered, cmd)
+		}
+	}
+	plan.Commands = filtered
+	return len(drop)
+}
+
+// ---------------------------------------------------------------------------
+// Read-only command dedup
+// ---------------------------------------------------------------------------
+
+// pruneRedundantReadOnly deduplicates read-only commands (describe-*, get-*)
+// that target the same resource. Keeps only the last occurrence per
+// {service, operation, target} group. Skips commands with produces.
+func pruneRedundantReadOnly(plan *maker.Plan) int {
+	if plan == nil || len(plan.Commands) < 2 {
+		return 0
+	}
+
+	type roKey struct {
+		service string
+		op      string
+		target  string
+	}
+
+	isReadOnlyOp := func(op string) bool {
+		return strings.HasPrefix(op, "describe-") ||
+			strings.HasPrefix(op, "get-") ||
+			strings.HasPrefix(op, "list-")
+	}
+
+	// Extract primary target resource from args.
+	primaryTarget := func(args []string) string {
+		targets := []string{"--instance-ids", "--id", "--target-group-arn",
+			"--names", "--load-balancer-arn", "--load-balancer-arns"}
+		for i := 0; i < len(args)-1; i++ {
+			flag := strings.TrimSpace(args[i])
+			for _, tf := range targets {
+				if strings.EqualFold(flag, tf) {
+					return strings.TrimSpace(args[i+1])
+				}
+			}
+		}
+		return ""
+	}
+
+	groups := map[roKey][]int{}
+	for i, cmd := range plan.Commands {
+		if len(cmd.Args) < 2 {
+			continue
+		}
+		svc := strings.ToLower(strings.TrimSpace(cmd.Args[0]))
+		op := strings.ToLower(strings.TrimSpace(cmd.Args[1]))
+		if !isReadOnlyOp(op) {
+			continue
+		}
+		// Skip commands that produce values needed downstream
+		if len(cmd.Produces) > 0 {
+			continue
+		}
+		target := primaryTarget(cmd.Args)
+		key := roKey{svc, op, target}
+		groups[key] = append(groups[key], i)
+	}
+
+	drop := map[int]bool{}
+	for _, indices := range groups {
+		if len(indices) < 2 {
+			continue
+		}
+		// Keep only the last occurrence
+		for _, idx := range indices[:len(indices)-1] {
+			drop[idx] = true
+		}
+	}
+
+	if len(drop) == 0 {
+		return 0
+	}
+
+	filtered := make([]maker.Command, 0, len(plan.Commands)-len(drop))
+	for i, cmd := range plan.Commands {
+		if !drop[i] {
+			filtered = append(filtered, cmd)
+		}
+	}
+	plan.Commands = filtered
+	return len(drop)
 }
