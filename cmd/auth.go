@@ -70,6 +70,13 @@ func runAuthLogin(_ *cobra.Command, _ []string) error {
 	h := sha256.Sum256([]byte(codeVerifier))
 	codeChallenge := base64.RawURLEncoding.EncodeToString(h[:])
 
+	// Generate random state parameter (required by OpenAI, min 8 chars).
+	stateBytes := make([]byte, 32)
+	if _, err := rand.Read(stateBytes); err != nil {
+		return fmt.Errorf("failed to generate state: %w", err)
+	}
+	state := base64.RawURLEncoding.EncodeToString(stateBytes)
+
 	// Build the authorization URL.
 	params := url.Values{
 		"client_id":             {oauthClientID},
@@ -78,6 +85,7 @@ func runAuthLogin(_ *cobra.Command, _ []string) error {
 		"scope":                 {"openid profile email offline_access"},
 		"code_challenge":        {codeChallenge},
 		"code_challenge_method": {"S256"},
+		"state":                 {state},
 	}
 	authURL := oauthAuthorizeURL + "?" + params.Encode()
 
